@@ -1,6 +1,6 @@
 [package]
 name = "stock-options"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Option pricing Greeks calculations using Black-Scholes and Bjerksund-Stensland models"
 license = "BSD-3-Clause"

@@ -235,11 +235,154 @@ pub mod black_scholes {
     }
 }
 
-/// Bjerksund-Stensland model for American options
+/// Bjerksund-Stensland 2002 model for American options
+///
+/// This implementation uses the Bjerksund-Stensland 2002 approximation for pricing
+/// American options, with Greeks computed via numerical differentiation of the price.
 pub mod bjerksund_stensland {
     use super::*;
 
-    /// Calculate the delta (sensitivity to the underlying price) of an American option.
+    /// Helper function phi() from the Bjerksund-Stensland 2002 paper
+    ///
+    /// φ(S, T, γ, H, I) = e^λ × S^γ × [N(d) - (I/S)^κ × N(d - 2ln(I/S)/(σ√T))]
+    /// where:
+    ///   λ = -rT + γbT + 0.5γ(γ-1)σ²T
+    ///   d = -[ln(S/H) + (b + (γ - 0.5)σ²)T] / (σ√T)
+    ///   κ = 2b/σ² + (2γ - 1)
+    fn phi(s: f64, t: f64, gamma: f64, h: f64, i: f64, r: f64, b: f64, sigma: f64) -> f64 {
+        let sigma_sq = sigma.powi(2);
+        let lambda = (-r * t + gamma * b * t + 0.5 * gamma * (gamma - 1.0) * sigma_sq * t).exp();
+        // Note: d uses ln(S/H), not ln(H/S)
+        let d = -((s / h).ln() + (b + (gamma - 0.5) * sigma_sq) * t) / (sigma * t.sqrt());
+        let kappa = 2.0 * b / sigma_sq + (2.0 * gamma - 1.0);
+
+        let n = Normal::new(0.0, 1.0).unwrap();
+
+        lambda * s.powf(gamma) * (n.cdf(d) - (i / s).powf(kappa) * n.cdf(d - 2.0 * (i / s).ln() / (sigma * t.sqrt())))
+    }
+
+    /// European call price using generalized Black-Scholes
+    fn european_call(s: f64, k: f64, t: f64, r: f64, b: f64, sigma: f64) -> f64 {
+        let sigma_sq = sigma.powi(2);
+        let d1 = ((s / k).ln() + (b + 0.5 * sigma_sq) * t) / (sigma * t.sqrt());
+        let d2 = d1 - sigma * t.sqrt();
+        let n = Normal::new(0.0, 1.0).unwrap();
+        s * ((b - r) * t).exp() * n.cdf(d1) - k * (-r * t).exp() * n.cdf(d2)
+    }
+
+    /// Calculate the price of an American call option using Bjerksund-Stensland 2002
+    fn call_price(s: f64, k: f64, t: f64, r: f64, b: f64, sigma: f64) -> f64 {
+        // If no time to expiry, return intrinsic value
+        if t <= 0.0 {
+            return (s - k).max(0.0);
+        }
+
+        // If b >= r, American call = European call (no early exercise benefit)
+        if b >= r {
+            return european_call(s, k, t, r, b, sigma);
+        }
+
+        let sigma_sq = sigma.powi(2);
+
+        // Calculate beta (must be > 1)
+        let beta = (0.5 - b / sigma_sq) + ((b / sigma_sq - 0.5).powi(2) + 2.0 * r / sigma_sq).sqrt();
+
+        // B_infinity = β/(β-1) * K
+        let b_infinity = beta / (beta - 1.0) * k;
+
+        // B_0 = max(K, r/(r-b) * K)
+        let b_0 = k.max(r / (r - b) * k);
+
+        // h(T) = -(bT + 2σ√T) * B_0 / (B_∞ - B_0)
+        let h_t = -(b * t + 2.0 * sigma * t.sqrt()) * b_0 / (b_infinity - b_0);
+
+        // I = B_0 + (B_∞ - B_0) * (1 - e^h(T))
+        let i = b_0 + (b_infinity - b_0) * (1.0 - h_t.exp());
+
+        // If S >= I, exercise immediately
+        if s >= i {
+            return s - k;
+        }
+
+        // t1 = 0.5 * (sqrt(5) - 1) * T (golden ratio split)
+        let t1 = 0.5 * (5.0_f64.sqrt() - 1.0) * t;
+
+        // h(t1) and I1
+        let h_t1 = -(b * t1 + 2.0 * sigma * t1.sqrt()) * b_0 / (b_infinity - b_0);
+        let i1 = b_0 + (b_infinity - b_0) * (1.0 - h_t1.exp());
+
+        // Alpha values
+        let alpha1 = (i - k) * i.powf(-beta);
+        let alpha2 = (i1 - k) * i1.powf(-beta);
+
+        // Bjerksund-Stensland 2002 American call price formula
+        let bs_price = alpha2 * phi(s, t1, beta, i1, i1, r, b, sigma)
+            - alpha2 * phi(s, t1, beta, i, i1, r, b, sigma)
+            + phi(s, t1, 1.0, i, i1, r, b, sigma)
+            - phi(s, t1, 1.0, k, i1, r, b, sigma)
+            - k * phi(s, t1, 0.0, i, i1, r, b, sigma)
+            + k * phi(s, t1, 0.0, k, i1, r, b, sigma)
+            + alpha1 * phi(s, t, beta, i, i1, r, b, sigma)
+            - alpha1 * phi(s, t, beta, i1, i1, r, b, sigma)
+            + phi(s, t, 1.0, i1, i1, r, b, sigma)
+            - phi(s, t, 1.0, i, i1, r, b, sigma)
+            - k * phi(s, t, 0.0, i1, i1, r, b, sigma)
+            + k * phi(s, t, 0.0, i, i1, r, b, sigma);
+
+        // American option price must be at least the European price
+        let euro_price = european_call(s, k, t, r, b, sigma);
+        bs_price.max(euro_price)
+    }
+
+    /// Calculate the price of an American put option using put-call transformation
+    fn put_price(s: f64, k: f64, t: f64, r: f64, b: f64, sigma: f64) -> f64 {
+        // Use put-call transformation:
+        // American put P(S, K, r, b) = American call C(K, S, r-b, -b)
+        call_price(k, s, t, r - b, -b, sigma)
+    }
+
+    /// Calculate the price of an American option using Bjerksund-Stensland 2002
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - The current price of the underlying asset
+    /// * `k` - The strike price of the option
+    /// * `t` - The time to expiration in years
+    /// * `r` - The risk-free interest rate
+    /// * `sigma` - The volatility of the underlying asset
+    /// * `q` - The dividend yield of the underlying asset
+    /// * `option_type` - The type of option (Call or Put)
+    ///
+    /// # Returns
+    ///
+    /// The price of the American option
+    pub fn price(
+        s: f64,
+        k: f64,
+        t: f64,
+        r: f64,
+        sigma: f64,
+        q: f64,
+        option_type: OptionType,
+    ) -> Result<f64, OptionError> {
+        let b = r - q; // cost of carry
+
+        let price = match option_type {
+            OptionType::Call => call_price(s, k, t, r, b, sigma),
+            OptionType::Put => put_price(s, k, t, r, b, sigma),
+        };
+
+        // Ensure price is at least intrinsic value
+        let intrinsic = match option_type {
+            OptionType::Call => (s - k).max(0.0),
+            OptionType::Put => (k - s).max(0.0),
+        };
+
+        Ok(price.max(intrinsic))
+    }
+
+    /// Calculate the delta (sensitivity to the underlying price) of an American option
+    /// using numerical differentiation.
     ///
     /// # Arguments
     ///
@@ -263,53 +406,14 @@ pub mod bjerksund_stensland {
         q: f64,
         option_type: OptionType,
     ) -> Result<f64, OptionError> {
-        let epsilon = 0.00001;
-        let t_sqrt = t.sqrt();
-        let b = q;
-        let beta = (0.5 - b / sigma.powi(2)) + ((b / sigma.powi(2) - 0.5).powi(2) + 2.0 * r / sigma.powi(2)).sqrt();
-        let b_infinity = beta / (beta - 1.0) * k;
-        let b_zero = match option_type {
-            OptionType::Call => k.max(r / (r - b) * k),
-            OptionType::Put => k.min(r / (r - b) * k),
-        };
-
-        let h_t = -(b * t + 2.0 * sigma * t_sqrt) * (k / (b_infinity - b_zero));
-        let x = 2.0 * r / (sigma.powi(2) * (1.0 - E.powf(-r * t)));
-        let y = 2.0 * b / (sigma.powi(2) * (1.0 - E.powf(-b * t)));
-        let b_t_infinity = b_infinity - (b_infinity - b_zero) * E.powf(h_t);
-        let b_t_zero = b_zero + (b_infinity - b_zero) * E.powf(h_t);
-
-        let d1 = (s / b_t_infinity).ln() + (b + sigma.powi(2) / 2.0) * t / (sigma * t_sqrt);
-        let d2 = (b_t_infinity / s).ln() + (b + sigma.powi(2) / 2.0) * t / (sigma * t_sqrt);
-        let d3 = ((s / b_t_zero).ln() + (b + sigma.powi(2) / 2.0) * t) / (sigma * t_sqrt);
-        let d4 = ((b_t_zero / s).ln() + (b + sigma.powi(2) / 2.0) * t) / (sigma * t_sqrt);
-
-        let n = Normal::new(0.0, 1.0).unwrap();
-        let n_d1 = n.cdf(d1);
-        let n_d2 = n.cdf(d2);
-        let n_d3 = n.cdf(d3);
-        let n_d4 = n.cdf(d4);
-
-        let (alpha, beta) = match option_type {
-            OptionType::Call => (-(r - b) * t - 2.0 * sigma * t_sqrt, 2.0 * (r - b) / sigma.powi(2)),
-            OptionType::Put => ((r - b) * t + 2.0 * sigma * t_sqrt, -2.0 * (r - b) / sigma.powi(2)),
-        };
-
-        let kappa = if b >= r || b <= epsilon {
-            0.0
-        } else {
-            2.0 * b / (sigma.powi(2) * (1.0 - E.powf(-r * t))) * (E.powf(alpha) * n.cdf(y) - (s / b_t_infinity).powf(beta) * n.cdf(y - 2.0 * alpha / (sigma * t_sqrt)))
-        };
-
-        let delta = match option_type {
-            OptionType::Call => n_d1 - (s / b_t_infinity).powf(x) * (n_d2 - kappa),
-            OptionType::Put => -n_d3 + (s / b_t_zero).powf(-x) * (n_d4 + kappa),
-        };
-
-        Ok(delta)
+        let ds = s * 0.0001; // Small perturbation
+        let p_up = price(s + ds, k, t, r, sigma, q, option_type)?;
+        let p_down = price(s - ds, k, t, r, sigma, q, option_type)?;
+        Ok((p_up - p_down) / (2.0 * ds))
     }
 
-    /// Calculate the gamma (second-order sensitivity to the underlying price) of an American option.
+    /// Calculate the gamma (second-order sensitivity to the underlying price) of an American option
+    /// using numerical differentiation.
     ///
     /// # Arguments
     ///
@@ -333,66 +437,15 @@ pub mod bjerksund_stensland {
         q: f64,
         option_type: OptionType,
     ) -> Result<f64, OptionError> {
-        let epsilon = 0.00001;
-        let t_sqrt = t.sqrt();
-        let b = q;
-
-        let beta = (0.5 - b / sigma.powi(2)) + ((b / sigma.powi(2) - 0.5).powi(2) + 2.0 * r / sigma.powi(2)).sqrt();
-        let b_infinity = beta / (beta - 1.0) * k;
-        let b_zero = match option_type {
-            OptionType::Call => k.max(r / (r - b) * k),
-            OptionType::Put => k.min(r / (r - b) * k),
-        };
-
-        let h_t = -(b * t + 2.0 * sigma * t_sqrt) * (k / (b_infinity - b_zero));
-        let x = 2.0 * r / (sigma.powi(2) * (1.0 - E.powf(-r * t)));
-        let y = 2.0 * b / (sigma.powi(2) * (1.0 - E.powf(-b * t)));
-        let b_t_infinity = b_infinity - (b_infinity - b_zero) * E.powf(h_t);
-        let b_t_zero = b_zero + (b_infinity - b_zero) * E.powf(h_t);
-
-        let d1 = (s / b_t_infinity).ln() + (b + sigma.powi(2) / 2.0) * t / (sigma * t_sqrt);
-        let d2 = (b_t_infinity / s).ln() + (b + sigma.powi(2) / 2.0) * t / (sigma * t_sqrt);
-        let d3 = ((s / b_t_zero).ln() + (b + sigma.powi(2) / 2.0) * t) / (sigma * t_sqrt);
-        let d4 = ((b_t_zero / s).ln() + (b + sigma.powi(2) / 2.0) * t) / (sigma * t_sqrt);
-
-        let n = Normal::new(0.0, 1.0).unwrap();
-        let n_d2 = n.cdf(d2);
-        let n_d4 = n.cdf(d4);
-        let n_prime_d1 = n.pdf(d1);
-        let n_prime_d2 = n.pdf(d2);
-        let n_prime_d3 = n.pdf(d3);
-        let n_prime_d4 = n.pdf(d4);
-
-        let (alpha, beta) = match option_type {
-            OptionType::Call => (-(r - b) * t - 2.0 * sigma * t_sqrt, 2.0 * (r - b) / sigma.powi(2)),
-            OptionType::Put => ((r - b) * t + 2.0 * sigma * t_sqrt, -2.0 * (r - b) / sigma.powi(2)),
-        };
-
-        let kappa = if b >= r || b <= epsilon {
-            0.0
-        } else {
-            2.0 * b / (sigma.powi(2) * (1.0 - E.powf(-r * t))) * (E.powf(alpha) * n.cdf(y) - (s / b_t_infinity).powf(beta) * n.cdf(y - 2.0 * alpha / (sigma * t_sqrt)))
-        };
-
-        let kappa_prime = if b >= r || b <= epsilon {
-            0.0
-        } else {
-            2.0 * b / (sigma.powi(2) * (1.0 - E.powf(-r * t))) * (E.powf(alpha) * n.pdf(y) * (-alpha / (sigma * t_sqrt)) - (s / b_t_infinity).powf(beta) * n.pdf(y - 2.0 * alpha / (sigma * t_sqrt)) * (-alpha / (sigma * t_sqrt)) * (beta - 1.0))
-        };
-
-        let gamma = match option_type {
-            OptionType::Call => {
-                n_prime_d1 / (s * sigma * t_sqrt) - x * (s / b_t_infinity).powf(x - 1.0) * (n_d2 - kappa) / b_t_infinity - (s / b_t_infinity).powf(x) * (n_prime_d2 * d2 / (sigma * t_sqrt) - kappa_prime) / s
-            },
-            OptionType::Put => {
-                n_prime_d3 / (s * sigma * t_sqrt) + x * (s / b_t_zero).powf(-x - 1.0) * (n_d4 + kappa) / b_t_zero + (s / b_t_zero).powf(-x) * (-n_prime_d4 * d4 / (sigma * t_sqrt) + kappa_prime) / s
-            },
-        };
-
-        Ok(gamma)
+        let ds = s * 0.0001; // Small perturbation
+        let p_up = price(s + ds, k, t, r, sigma, q, option_type)?;
+        let p_mid = price(s, k, t, r, sigma, q, option_type)?;
+        let p_down = price(s - ds, k, t, r, sigma, q, option_type)?;
+        Ok((p_up - 2.0 * p_mid + p_down) / (ds * ds))
     }
 
-    /// Calculate the theta (sensitivity to time to expiration) of an American option.
+    /// Calculate the theta (sensitivity to time to expiration) of an American option
+    /// using numerical differentiation.
     ///
     /// # Arguments
     ///
@@ -416,57 +469,15 @@ pub mod bjerksund_stensland {
         q: f64,
         option_type: OptionType,
     ) -> Result<f64, OptionError> {
-        let epsilon = 0.00001;
-        let t_sqrt = t.sqrt();
-        let b = q;
-        let beta = (0.5 - b / sigma.powi(2)) + ((b / sigma.powi(2) - 0.5).powi(2) + 2.0 * r / sigma.powi(2)).sqrt();
-        let b_infinity = beta / (beta - 1.0) * k;
-        let b_zero = match option_type {
-            OptionType::Call => k.max(r / (r - b) * k),
-            OptionType::Put => k.min(r / (r - b) * k),
-        };
-
-        let h_t = -(b * t + 2.0 * sigma * t_sqrt) * (k / (b_infinity - b_zero));
-        let x = 2.0 * r / (sigma.powi(2) * (1.0 - E.powf(-r * t)));
-        let y = 2.0 * b / (sigma.powi(2) * (1.0 - E.powf(-b * t)));
-        let b_t_infinity = b_infinity - (b_infinity - b_zero) * E.powf(h_t);
-        let b_t_zero = b_zero + (b_infinity - b_zero) * E.powf(h_t);
-
-        let d1 = (s / b_t_infinity).ln() + (b + sigma.powi(2) / 2.0) * t / (sigma * t_sqrt);
-        let d2 = (b_t_infinity / s).ln() + (b + sigma.powi(2) / 2.0) * t / (sigma * t_sqrt);
-        let d3 = ((s / b_t_zero).ln() + (b + sigma.powi(2) / 2.0) * t) / (sigma * t_sqrt);
-        let d4 = ((b_t_zero / s).ln() + (b + sigma.powi(2) / 2.0) * t) / (sigma * t_sqrt);
-
-        let n = Normal::new(0.0, 1.0).unwrap();
-        let n_d2 = n.cdf(d2);
-        let n_d4 = n.cdf(d4);
-        let n_prime_d1 = n.pdf(d1);
-        let n_prime_d3 = n.pdf(d3);
-
-        let (alpha, beta) = match option_type {
-            OptionType::Call => (-(r - b) * t - 2.0 * sigma * t_sqrt, 2.0 * (r - b) / sigma.powi(2)),
-            OptionType::Put => ((r - b) * t + 2.0 * sigma * t_sqrt, -2.0 * (r - b) / sigma.powi(2)),
-        };
-
-        let kappa = if b >= r || b <= epsilon {
-            0.0
-        } else {
-            2.0 * b / (sigma.powi(2) * (1.0 - E.powf(-r * t))) * (E.powf(alpha) * n.cdf(y) - (s / b_t_infinity).powf(beta) * n.cdf(y - 2.0 * alpha / (sigma * t_sqrt)))
-        };
-
-        let theta = match option_type {
-            OptionType::Call => {
-                -s * n_prime_d1 * sigma / (2.0 * t_sqrt) - r * k * E.powf(-r * t) * n_d2 + r * b_t_infinity * (s / b_t_infinity).powf(x) * (n_d2 - kappa)
-            },
-            OptionType::Put => {
-                -s * n_prime_d3 * sigma / (2.0 * t_sqrt) + r * k * E.powf(-r * t) * n_d4 - r * b_t_zero * (s / b_t_zero).powf(-x) * (n_d4 + kappa)
-            },
-        };
-
-        Ok(theta / 365.0)
+        let dt = 1.0 / 365.0; // One day
+        let p_now = price(s, k, t, r, sigma, q, option_type)?;
+        let p_later = price(s, k, (t - dt).max(0.0001), r, sigma, q, option_type)?;
+        // Theta is the change in price as time decreases (negative dt)
+        Ok(p_later - p_now)
     }
 
-    /// Calculate the vega (sensitivity to volatility) of an American option.
+    /// Calculate the vega (sensitivity to volatility) of an American option
+    /// using numerical differentiation.
     ///
     /// # Arguments
     ///
@@ -480,7 +491,7 @@ pub mod bjerksund_stensland {
     ///
     /// # Returns
     ///
-    /// The vega of the American option
+    /// The vega of the American option (per 1% change in volatility)
     pub fn vega(
         s: f64,
         k: f64,
@@ -490,47 +501,15 @@ pub mod bjerksund_stensland {
         q: f64,
         option_type: OptionType,
     ) -> Result<f64, OptionError> {
-        let epsilon = 0.00001;
-        let t_sqrt = t.sqrt();
-        let b = q;
-        let beta = (0.5 - b / sigma.powi(2)) + ((b / sigma.powi(2) - 0.5).powi(2) + 2.0 * r / sigma.powi(2)).sqrt();
-        let b_infinity = beta / (beta - 1.0) * k;
-        let b_zero = match option_type {
-            OptionType::Call => k.max(r / (r - b) * k),
-            OptionType::Put => k.min(r / (r - b) * k),
-        };
-        let h_t = -(b * t + 2.0 * sigma * t_sqrt) * (k / (b_infinity - b_zero));
-        let y = 2.0 * b / (sigma.powi(2) * (1.0 - E.powf(-b * t) + epsilon));
-        let b_t_infinity = b_infinity - (b_infinity - b_zero) * E.powf(h_t);
-        let b_t_zero = b_zero + (b_infinity - b_zero) * E.powf(h_t);
-
-        let (d1, _, d3, _) = (
-            (s / b_t_infinity).ln() + (b + sigma.powi(2) / 2.0) * t / (sigma * t_sqrt),
-            (b_t_infinity / s).ln() + (b + sigma.powi(2) / 2.0) * t / (sigma * t_sqrt),
-            ((s / b_t_zero).ln() + (b + sigma.powi(2) / 2.0) * t) / (sigma * t_sqrt),
-            ((b_t_zero / s).ln() + (b + sigma.powi(2) / 2.0) * t) / (sigma * t_sqrt),
-        );
-
-        let n = Normal::new(0.0, 1.0).unwrap();
-        let n_prime_d1 = if d1.abs() > 10.0 { 1e-10 } else { n.pdf(d1) };
-        let n_prime_d3 = if d3.abs() > 10.0 { 1e-10 } else { n.pdf(d3) };
-        let (_, beta) = match option_type {
-            OptionType::Call => (-(r - b) * t - 2.0 * sigma * t_sqrt, 2.0 * (r - b) / sigma.powi(2)),
-            OptionType::Put => ((r - b) * t + 2.0 * sigma * t_sqrt, -2.0 * (r - b) / sigma.powi(2)),
-        };
-
-        let vega = match option_type {
-            OptionType::Call => {
-                s * t_sqrt * n_prime_d1 * (1.0 - (s / b_t_infinity).powf(beta) * n.cdf(y))
-            }
-            OptionType::Put => {
-                s * t_sqrt * n_prime_d3 * (1.0 - (s / b_t_zero).powf(-beta) * n.cdf(-y))
-            }
-        };
-        Ok(vega)
+        let d_sigma = 0.0001; // Small perturbation
+        let p_up = price(s, k, t, r, sigma + d_sigma, q, option_type)?;
+        let p_down = price(s, k, t, r, sigma - d_sigma, q, option_type)?;
+        // Vega: dP/d_sigma (unscaled, same convention as Black-Scholes)
+        Ok((p_up - p_down) / (2.0 * d_sigma))
     }
 
-    /// Calculate the rho (sensitivity to interest rate) of an American option.
+    /// Calculate the rho (sensitivity to interest rate) of an American option
+    /// using numerical differentiation.
     ///
     /// # Arguments
     ///
@@ -554,50 +533,11 @@ pub mod bjerksund_stensland {
         q: f64,
         option_type: OptionType,
     ) -> Result<f64, OptionError> {
-        let epsilon = 0.00001;
-        let t_sqrt = t.sqrt();
-        let b = q;
-        let beta = (0.5 - b / sigma.powi(2)) + ((b / sigma.powi(2) - 0.5).powi(2) + 2.0 * r / sigma.powi(2)).sqrt();
-        let b_infinity = beta / (beta - 1.0) * k;
-        let b_zero = match option_type {
-            OptionType::Call => k.max(r / (r - b) * k),
-            OptionType::Put => k.min(r / (r - b) * k),
-        };
-
-        let h_t = -(b * t + 2.0 * sigma * t_sqrt) * (k / (b_infinity - b_zero));
-        let x = 2.0 * r / (sigma.powi(2) * (1.0 - E.powf(-r * t)));
-        let y = 2.0 * b / (sigma.powi(2) * (1.0 - E.powf(-b * t)));
-        let b_t_infinity = b_infinity - (b_infinity - b_zero) * E.powf(h_t);
-        let b_t_zero = b_zero + (b_infinity - b_zero) * E.powf(h_t);
-
-        let d2 = (b_t_infinity / s).ln() + (b + sigma.powi(2) / 2.0) * t / (sigma * t_sqrt);
-        let d4 = ((b_t_zero / s).ln() + (b + sigma.powi(2) / 2.0) * t) / (sigma * t_sqrt);
-
-        let n = Normal::new(0.0, 1.0).unwrap();
-        let n_d2 = n.cdf(d2);
-        let n_d4 = n.cdf(d4);
-
-        let (alpha, beta) = match option_type {
-            OptionType::Call => (-(r - b) * t - 2.0 * sigma * t_sqrt, 2.0 * (r - b) / sigma.powi(2)),
-            OptionType::Put => ((r - b) * t + 2.0 * sigma * t_sqrt, -2.0 * (r - b) / sigma.powi(2)),
-        };
-
-        let kappa = if b >= r || b <= epsilon {
-            0.0
-        } else {
-            2.0 * b / (sigma.powi(2) * (1.0 - E.powf(-r * t))) * (E.powf(alpha) * n.cdf(y) - (s / b_t_infinity).powf(beta) * n.cdf(y - 2.0 * alpha / (sigma * t_sqrt)))
-        };
-
-        let rho = match option_type {
-            OptionType::Call => {
-                k * t * E.powf(-r * t) * n_d2 + t * b_t_infinity * (s / b_t_infinity).powf(x) * (n_d2 - kappa)
-            },
-            OptionType::Put => {
-                -k * t * E.powf(-r * t) * n_d4 - t * b_t_zero * (s / b_t_zero).powf(-x) * (n_d4 + kappa)
-            },
-        };
-
-        Ok(rho / 100.0)
+        let dr = 0.0001; // Small perturbation
+        let p_up = price(s, k, t, r + dr, sigma, q, option_type)?;
+        let p_down = price(s, k, t, r - dr, sigma, q, option_type)?;
+        // Rho per 1% change
+        Ok((p_up - p_down) / (2.0 * dr) / 100.0)
     }
 
     /// Calculate all Greeks for an American option.
