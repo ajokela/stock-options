@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Option pricing Greeks calculations using Black-Scholes and Bjerksund-Stensland models"
 license = "BSD-3-Clause"
-repository = "https://github.com/alexjokela/stock-options"
+repository = "https://github.com/ajokela/stock-options"
 keywords = ["finance", "options", "black-scholes", "greeks", "derivatives"]
 categories = ["finance", "mathematics"]
 

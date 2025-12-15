@@ -17,7 +17,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-stock-options = { git = "https://github.com/alexjokela/stock-options" }
+stock-options = { git = "https://github.com/ajokela/stock-options" }
 ```
 
 ## Usage
